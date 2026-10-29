@@ -37,3 +37,6 @@ Thumbs.db
 
 test.py
 
+# Local tools
+tools/
+

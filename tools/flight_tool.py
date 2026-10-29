@@ -13,7 +13,7 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
 
-DEFAULT_ORIGIN_DATA=os.getenv("DEFAULT_ORIGIN_DATA","DAC")
+DEFAULT_ORIGIN_IATA=os.getenv("DEFAULT_ORIGIN_DATA","DAC")
 
 BASE_URL="http://api.aviationstack.com/v1/flights"
 
@@ -287,7 +287,7 @@ def find_location_mentions(query: str):
             mentions.append(name)
 
     # City names from our preferred city map
-    for city in CITY_MAIN_AIRPORT:
+    for city in CITY_MAIN_AIRPORTS:
         if re.search(rf"\b{re.escape(city)}\b", q):
             mentions.append(city)
 
