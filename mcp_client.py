@@ -20,12 +20,45 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 
+
+
+# Automatically find the current project folder.
+# This replaces the hard-coded Windows paths.
+PROJECT_DIR = Path(__file__).resolve().parent
+WEATHER_SERVER_PATH = PROJECT_DIR / "custom_weather_mcp_server.py"
+
+
+
+# Preserve the complete Windows environment when starting
+# local stdio MCP servers.
+AVIATION_ENV = os.environ.copy()
+AVIATION_ENV["AVIATION_STACK_API_KEY"] = (
+    AVIATION_STACK_API_KEY or ""
+)
+
+WEATHER_ENV = os.environ.copy()
+WEATHER_ENV["OPENWEATHER_API_KEY"] = (
+    OPENWEATHER_API_KEY or ""
+)
+
+
+
+
+# ==========================================
+# LLM
+# ==========================================
+
 llm=ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY
 )
 
 
+
+
+# ==========================================
+# MCP client configuration
+# ==========================================
 client=MultiServerMCPClient(
     {
         "tavily": {
@@ -42,9 +75,7 @@ client=MultiServerMCPClient(
             "args": [
                 "aviationstack-mcp"
             ],
-            "env": {
-                "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY
-            }
+            "env":AVIATION_ENV
         },
 
         # Start the local weather MCP server as a child process. Using the
@@ -53,13 +84,14 @@ client=MultiServerMCPClient(
         "weather": {
             "transport": "stdio",
             "command": sys.executable,
+             # Automatically use custom_weather_mcp_server.py
+            # from the current project directory.
             "args": [
-                str(Path(__file__).with_name("weather_mcp_server.py"))
+                str(WEATHER_SERVER_PATH)
             ],
-            "env": {
-                "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY
-            }
-        },
+
+            "env": WEATHER_ENV
+        }
         
     }
 )
@@ -68,7 +100,9 @@ client=MultiServerMCPClient(
 
 
 
-
+# ==========================================
+# Diagnostic function
+# ==========================================
 async def get_all_tools():
     """
     Load each MCP server separately.
@@ -300,24 +334,24 @@ async def initialize_weather_tools():
         )
 
 
-async def weather_mcp_call(
-    tool_name: str,
-    tool_args: dict = None
-):
-    """Invoke a tool from the local weather MCP server."""
+# async def weather_mcp_call(
+#     tool_name: str,
+#     tool_args: dict = None
+# ):
+#     """Invoke a tool from the local weather MCP server."""
 
-    await initialize_weather_tools()
+#     await initialize_weather_tools()
 
-    tool = weather_tools.get(tool_name)
+#     tool = weather_tools.get(tool_name)
 
-    if tool is None:
-        available_tools = ", ".join(sorted(weather_tools.keys()))
-        raise ValueError(
-            f"Weather tool '{tool_name}' was not found. "
-            f"Available tools: {available_tools or 'none'}"
-        )
+#     if tool is None:
+#         available_tools = ", ".join(sorted(weather_tools.keys()))
+#         raise ValueError(
+#             f"Weather tool '{tool_name}' was not found. "
+#             f"Available tools: {available_tools or 'none'}"
+#         )
 
-    return await tool.ainvoke(tool_args or {})
+#     return await tool.ainvoke(tool_args or {})
 
 
 
