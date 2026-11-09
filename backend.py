@@ -29,7 +29,15 @@ from langchain_core.messages import (
 from langchain_groq import ChatGroq
 # from tools.tavily_tool import tavily_search
 # from tools.flight_tool import search_flights
-from mcp_client import tavily_mcp_search, aviation_mcp_call ,extract_destination, forecast_mcp_search, weather_mcp_search
+from mcp_client import (
+    tavily_mcp_search,
+    aviation_mcp_call,
+    extract_destination,
+    forecast_mcp_search,
+    weather_mcp_search,
+    slice_hotel_results,
+    slice_tool_output,
+)
 
 
 
@@ -62,6 +70,8 @@ llm=ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY
 )
+
+DEFAULT_ORIGIN = os.getenv("DEFAULT_ORIGIN_DATA", "Delhi (DEL)")
 
 
 
@@ -139,12 +149,25 @@ def _json_from_llm(text: str) -> dict[str, Any]:
 def _empty_constraints() -> dict[str, Any]:
     return {
         "destination": "",
-        "origin": "",
+        "origin": DEFAULT_ORIGIN,
         "duration": "",
         "budget": "",
         "travel_style": "",
         "special_preferences": [],
     }
+
+
+def _cap_context(text: Any, max_chars: int = 2000) -> str:
+    """
+    Cap context string to prevent blowing the 8,000 token limit
+    when specialist outputs accumulate in prompts.
+    """
+    if not text:
+        return ""
+    val = str(text).strip()
+    if len(val) > max_chars:
+        return val[:max_chars].rsplit(" ", 1)[0] + "... [trimmed for context limits]"
+    return val
     
     
 
@@ -229,7 +252,7 @@ def supervisor_agent(state:TravelState):
         "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
         "trip_constraints": {{
             "destination": "",
-            "origin": "",
+            "origin": "Default is Delhi, India (DEL) if traveler does not specify origin",
             "duration": "",
             "budget": "",
             "travel_style": "",
@@ -262,6 +285,8 @@ def supervisor_agent(state:TravelState):
         parsed_constraints=parsed.get("trip_constraints",{})
         if isinstance(parsed_constraints,dict):
             constraints.update(parsed_constraints)
+        if not constraints.get("origin"):
+            constraints["origin"] = DEFAULT_ORIGIN
             
         reasoning=str(parsed.get("reasoning","")).strip()
         llm_calls+=1
@@ -308,12 +333,17 @@ def guardrail_blocked_agent(state: TravelState):
 
 
 
-# Flight Tool Router Prompt
+# =========================
+# Flight Agent
+# =========================
 FLIGHT_AGENT_PROMPT = """
 You are a travel flight expert.
 
 User Query:
 {query}
+
+Trip Origin / Departure Location:
+{origin}
 
 Airport Information:
 {airport_data}
@@ -322,40 +352,11 @@ Airline Information:
 {airline_data}
 
 Generate:
-
-1. Likely departure airport
+1. Likely departure airport (Default is Delhi / Indira Gandhi International Airport DEL if origin is not explicitly specified otherwise)
 2. Likely arrival airport
 3. Airlines serving this route
 4. Typical flight duration
-5. Estimated airfare range
-6. Peak season pricing warning
-7. Booking advice
-
-Return concise travel guidance.
-"""
-
-
-# =========================
-# Flight Agent - original behavior kept
-# =========================
-FLIGHT_AGENT_PROMPT = """
-You are a travel flight expert.
-
-User Query:
-{query}
-
-Airport Information:
-{airport_data}
-
-Airline Information:
-{airline_data}
-
-Generate:
-1. Likely departure airport
-2. Likely arrival airport
-3. Airlines serving this route
-4. Typical flight duration
-5. Estimated airfare range
+5. Estimated airfare range (specify in INR / ₹ or local currency)
 6. Peak season pricing warning
 7. Booking advice
 
@@ -366,6 +367,8 @@ Return concise travel guidance.
 def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
     query = state["user_query"]
+    constraints = state.get("trip_constraints", {})
+    origin = constraints.get("origin") or DEFAULT_ORIGIN
 
     try:
         airports = asyncio.run(aviation_mcp_call("list_airports"))
@@ -374,15 +377,22 @@ def flight_agent(state: TravelState):
         print("\nAIRPORTS:", airports)
         print("\nAIRLINES:", airlines)
 
+        # Slice tool outputs to top 5 items and cap character length to stay under token limits
+        airport_summary = slice_tool_output(airports, max_items=5, max_chars=1200)
+        airline_summary = slice_tool_output(airlines, max_items=5, max_chars=1200)
+
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            origin=origin,
+            airport_data=airport_summary,
+            airline_data=airline_summary,
         )
 
         response = llm.invoke(
             [
-                SystemMessage(content="You are an expert travel flight planner."),
+                SystemMessage(
+                    content="You are an expert travel flight planner. Default the trip origin to Delhi, India (DEL - Indira Gandhi International Airport) unless specified otherwise."
+                ),
                 HumanMessage(content=prompt),
             ]
         )
@@ -395,26 +405,10 @@ def flight_agent(state: TravelState):
         "messages": [AIMessage(content="Flight recommendations generated")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
-    
 
-# def flight_agent(state:TravelState):
-#     query=state["user_query"]
-#     flight_data=search_flights(query)
-    
-#     return{
-#         "flight_results":flight_data,
-#         "messages":[
-#             AIMessage(content="Flight results fetched.")
-#         ],
-#         "llm_calls":state.get("llm_calls",0)+1
-#     }
-    
- 
- 
- 
-    
+
 # =========================
-# Hotel Agent - original behavior kept
+# Hotel Agent
 # =========================
 def hotel_agent(state: TravelState):
     query = (
@@ -423,9 +417,11 @@ def hotel_agent(state: TravelState):
     )
 
     try:
-        hotel_results = asyncio.run(
+        raw_results = asyncio.run(
             tavily_mcp_search(query)
         )
+        # Ensure results are sliced to top 3-5 items to stay under 8,000 token limit
+        hotel_results = slice_hotel_results(raw_results, max_items=5)
 
     except Exception as exc:
         print(
@@ -459,10 +455,6 @@ def hotel_agent(state: TravelState):
 # =========================
 # Weather Agent
 # =========================
-
-# =========================
-# Weather Agent - original behavior kept
-# =========================
 def weather_agent(state: TravelState):
     city = extract_destination(
         state["user_query"]
@@ -477,13 +469,17 @@ def weather_agent(state: TravelState):
             forecast_mcp_search(city)
         )
 
+        # Slice and format weather/forecast data to stay within token limits
+        weather_str = slice_tool_output(weather_data, max_items=5, max_chars=800)
+        forecast_str = slice_tool_output(forecast_data, max_items=5, max_chars=1000)
+
         weather_results = f"""
 Current Weather:
-{weather_data}
+{weather_str}
 
 Forecast:
-{forecast_data}
-"""
+{forecast_str}
+""".strip()
 
     except Exception as exc:
         print(
@@ -526,21 +522,21 @@ def budget_agent(state: TravelState):
         {state.get('trip_constraints', {})}
 
         Flight Results:
-        {state.get('flight_results', '')}
+        {_cap_context(state.get('flight_results', ''), 1500)}
 
         Hotel Results:
-        {state.get('hotel_results', '')}
+        {_cap_context(state.get('hotel_results', ''), 1500)}
 
         Weather Results:
-        {state.get('weather_results', '')}
+        {_cap_context(state.get('weather_results', ''), 1000)}
 
         Return:
-        1. Estimated cost categories
+        1. Estimated cost categories (in INR / ₹ unless another currency is requested)
         2. Budget risk areas
         3. Money-saving suggestions
         4. Overall feasibility
 
-        If exact live prices are unavailable, clearly label estimates as approximate.
+        If exact live prices are unavailable, clearly label estimates as approximate. Provide cost figures in Indian Rupees (INR / ₹) by default.
     """
 
     response = llm.invoke(
@@ -573,16 +569,16 @@ def itinerary_agent(state: TravelState):
         {state.get('trip_constraints', {})}
 
         Flight Results:
-        {state.get('flight_results', '')}
+        {_cap_context(state.get('flight_results', ''), 1500)}
 
         Hotel Results:
-        {state.get('hotel_results', '')}
+        {_cap_context(state.get('hotel_results', ''), 1500)}
 
         Weather Results:
-        {state.get('weather_results', '')}
+        {_cap_context(state.get('weather_results', ''), 1000)}
 
         Budget Results:
-        {state.get('budget_results', '')}
+        {_cap_context(state.get('budget_results', ''), 1500)}
 
         Make the itinerary practical, budget-aware, and easy to follow.
         Create a clear draft that is ready for human review.
@@ -668,19 +664,19 @@ Supervisor Constraints:
 {state.get('trip_constraints', {})}
 
 Flights:
-{state.get('flight_results', '')}
+{_cap_context(state.get('flight_results', ''), 1500)}
 
 Hotels:
-{state.get('hotel_results', '')}
+{_cap_context(state.get('hotel_results', ''), 1500)}
 
 Weather:
-{state.get('weather_results', '')}
+{_cap_context(state.get('weather_results', ''), 1000)}
 
 Budget Analysis:
-{state.get('budget_results', '')}
+{_cap_context(state.get('budget_results', ''), 1500)}
 
 Draft Itinerary:
-{state.get('itinerary', '')}
+{_cap_context(state.get('itinerary', ''), 2500)}
 
 Format the final answer beautifully using these sections:
 1. Trip Summary
@@ -693,6 +689,8 @@ Format the final answer beautifully using these sections:
 
 Important:
 - Be clear and practical.
+- Unless the traveler explicitly specified another origin, assume the trip originates from Delhi, India (DEL).
+- State estimated costs and budgets in Indian Rupees (INR / ₹) alongside destination currencies where relevant.
 - Mention that live flight APIs may not provide ticket prices when pricing is unavailable.
 - Include weather-based travel advice.
 - Keep the response useful for real travel planning.

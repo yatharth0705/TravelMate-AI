@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend import run_travel_agent, resume_travel_agent
 
@@ -61,6 +61,7 @@ async def home(request:Request):
     )
     
     
+@app.post("/api/travel")
 async def travel_planner(request_data: TravelRequest):
     try:
         user_message = request_data.message.strip()

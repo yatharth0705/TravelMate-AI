@@ -1,6 +1,8 @@
 import os
 import sys
+import json
 from pathlib import Path
+from typing import Any
 import certifi
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -25,7 +27,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Automatically find the current project folder.
 # This replaces the hard-coded Windows paths.
 PROJECT_DIR = Path(__file__).resolve().parent
-WEATHER_SERVER_PATH = PROJECT_DIR / "custom_weather_mcp_server.py"
+WEATHER_SERVER_PATH = (
+    PROJECT_DIR / "weather_mcp_server.py"
+    if (PROJECT_DIR / "weather_mcp_server.py").exists()
+    else PROJECT_DIR / "custom_weather_mcp_server.py"
+)
 
 
 
@@ -192,16 +198,177 @@ async def initialize_mcp():
         
         
         
-async def tavily_mcp_search(query: str):
+def slice_hotel_results(
+    raw_result: Any,
+    max_items: int = 5,
+    max_snippet_len: int = 250,
+) -> str:
+    """
+    Slice and format hotel/Tavily search results to the top 3-5 items to stay well
+    within LLM token limits (e.g. 8,000 token limit) rather than dumping full web responses.
+    """
+    if not raw_result:
+        return "No hotel information available."
+
+    # Handle LangChain MCP content block lists (e.g. [{'type': 'text', 'text': ...}])
+    if isinstance(raw_result, list):
+        if len(raw_result) > 0 and isinstance(raw_result[0], dict) and "text" in raw_result[0]:
+            raw_result = "\n".join(
+                str(block["text"])
+                for block in raw_result
+                if isinstance(block, dict) and "text" in block
+            )
+        elif len(raw_result) > 0 and hasattr(raw_result[0], "text"):
+            raw_result = "\n".join(
+                str(getattr(block, "text", ""))
+                for block in raw_result
+            )
+
+    # Parse JSON if raw_result is a JSON string
+    parsed = None
+    if isinstance(raw_result, str):
+        text = raw_result.strip()
+        start_brace = text.find("{")
+        start_bracket = text.find("[")
+        if start_brace != -1 or start_bracket != -1:
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                try:
+                    if start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
+                        end_brace = text.rfind("}")
+                        if end_brace > start_brace:
+                            parsed = json.loads(text[start_brace : end_brace + 1])
+                    elif start_bracket != -1:
+                        end_bracket = text.rfind("]")
+                        if end_bracket > start_bracket:
+                            parsed = json.loads(text[start_bracket : end_bracket + 1])
+                except Exception:
+                    pass
+    elif isinstance(raw_result, (dict, list)):
+        parsed = raw_result
+
+    items = []
+    direct_answer = ""
+
+    if isinstance(parsed, dict):
+        direct_answer = parsed.get("answer", "") or ""
+        if "results" in parsed and isinstance(parsed["results"], list):
+            items = parsed["results"]
+        elif "data" in parsed and isinstance(parsed["data"], list):
+            items = parsed["data"]
+        elif "hotels" in parsed and isinstance(parsed["hotels"], list):
+            items = parsed["hotels"]
+    elif isinstance(parsed, list):
+        items = parsed
+
+    if items:
+        sliced_items = items[:max_items]
+        formatted = []
+        if direct_answer:
+            summary = direct_answer.strip()
+            if len(summary) > 250:
+                summary = summary[:250].rsplit(" ", 1)[0] + "..."
+            formatted.append(f"Search Summary: {summary}\n")
+
+        for idx, item in enumerate(sliced_items, 1):
+            if isinstance(item, dict):
+                title = item.get("title") or item.get("name") or f"Hotel Option {idx}"
+                url = item.get("url") or ""
+                snippet = (
+                    item.get("content")
+                    or item.get("snippet")
+                    or item.get("description")
+                    or ""
+                )
+                snippet = str(snippet).strip().replace("\n", " ")
+                if len(snippet) > max_snippet_len:
+                    snippet = snippet[:max_snippet_len].rsplit(" ", 1)[0] + "..."
+
+                entry = f"{idx}. {title}"
+                if url:
+                    entry += f"\n   Website: {url}"
+                if snippet:
+                    entry += f"\n   Details: {snippet}"
+                formatted.append(entry)
+            else:
+                formatted.append(f"{idx}. {str(item)[:max_snippet_len]}")
+        return "\n\n".join(formatted)
+
+    # Fallback for plain text: cap to reasonable length to avoid blowing 8k token context
+    text_res = str(raw_result).strip()
+    if len(text_res) > 1800:
+        return text_res[:1800].rsplit(" ", 1)[0] + "... [trimmed for context limits]"
+    return text_res
+
+
+def slice_tool_output(
+    data: Any,
+    max_items: int = 5,
+    max_chars: int = 1200,
+) -> str:
+    """
+    Cap and slice general tool outputs (airports, airlines, weather, etc.) to the top 3-5 items
+    and a safe character length to prevent context explosion.
+    """
+    if not data:
+        return "No data available."
+
+    if isinstance(data, list):
+        if len(data) > 0 and isinstance(data[0], dict) and "text" in data[0]:
+            data = "\n".join(
+                str(block["text"])
+                for block in data
+                if isinstance(block, dict) and "text" in block
+            )
+        elif len(data) > 0 and hasattr(data[0], "text"):
+            data = "\n".join(str(getattr(block, "text", "")) for block in data)
+
+    parsed = None
+    if isinstance(data, str):
+        text = data.strip()
+        if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                pass
+    elif isinstance(data, (dict, list)):
+        parsed = data
+
+    if isinstance(parsed, dict):
+        if "data" in parsed and isinstance(parsed["data"], list):
+            items = parsed["data"][:max_items]
+            return json.dumps(items, indent=2)[:max_chars]
+        if "results" in parsed and isinstance(parsed["results"], list):
+            items = parsed["results"][:max_items]
+            return json.dumps(items, indent=2)[:max_chars]
+        return json.dumps(parsed, indent=2)[:max_chars]
+    elif isinstance(parsed, list):
+        items = parsed[:max_items]
+        return json.dumps(items, indent=2)[:max_chars]
+
+    text_res = str(data).strip()
+    if len(text_res) > max_chars:
+        return text_res[:max_chars].rsplit(" ", 1)[0] + "... [trimmed]"
+    return text_res
+
+
+async def tavily_mcp_search(query: str, max_items: int = 5):
     await initialize_mcp()
 
-    result = await search_tool.ainvoke(
-        {
-            "query": query
-        }
-    )
+    tool_args = {"query": query}
+    # Pass max_results to Tavily MCP if supported by tool schema
+    if hasattr(search_tool, "args") and isinstance(search_tool.args, dict) and "max_results" in search_tool.args:
+        tool_args["max_results"] = max_items
+    elif hasattr(search_tool, "args_schema") and search_tool.args_schema:
+        fields = getattr(search_tool.args_schema, "model_fields", {})
+        if "max_results" in fields:
+            tool_args["max_results"] = max_items
 
-    return result
+    result = await search_tool.ainvoke(tool_args)
+
+    # Slice output to top 3-5 items rather than dumping full web responses
+    return slice_hotel_results(result, max_items=max_items)
 
 
 
